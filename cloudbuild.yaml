@@ -1,0 +1,80 @@
+# cloudbuild.yaml — GCP Cloud Build → Cloud Run deployment pipeline
+#
+# Setup steps:
+#   1. Enable APIs: Cloud Build, Cloud Run, Artifact Registry
+#   2. Create an Artifact Registry Docker repo named: ai-lead-enrichment
+#   3. Set Cloud Build substitution variables (or use triggers with variables):
+#        _REGION             e.g. us-central1
+#        _SERVICE_NAME       e.g. ai-lead-enrichment
+#        _ARTIFACT_REGISTRY  e.g. us-central1-docker.pkg.dev/YOUR_PROJECT/ai-lead-enrichment
+#
+# Secrets (set via Cloud Run --set-secrets or Secret Manager):
+#   PERPLEXITY_API_KEY, FIREBASE_PROJECT_ID
+
+substitutions:
+  _REGION: us-central1
+  _SERVICE_NAME: ai-lead-enrichment
+  _ARTIFACT_REGISTRY: us-central1-docker.pkg.dev/${PROJECT_ID}/ai-lead-enrichment
+
+steps:
+  # ── Step 1: Build Docker image ──────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - --tag
+      - ${_ARTIFACT_REGISTRY}/${_SERVICE_NAME}:$COMMIT_SHA
+      - --tag
+      - ${_ARTIFACT_REGISTRY}/${_SERVICE_NAME}:latest
+      - --cache-from
+      - ${_ARTIFACT_REGISTRY}/${_SERVICE_NAME}:latest
+      - .
+
+  # ── Step 2: Push image to Artifact Registry ─────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push
+    args:
+      - push
+      - --all-tags
+      - ${_ARTIFACT_REGISTRY}/${_SERVICE_NAME}
+    waitFor: [build]
+
+  # ── Step 3: Deploy to Cloud Run ─────────────────────────────────────
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME}
+      - --image
+      - ${_ARTIFACT_REGISTRY}/${_SERVICE_NAME}:$COMMIT_SHA
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+      - --allow-unauthenticated         # Public endpoint (ERP calls it directly)
+      - --min-instances
+      - "1"                             # Keep 1 warm instance — prevents BG task loss
+      - --max-instances
+      - "10"
+      - --memory
+      - "512Mi"
+      - --cpu
+      - "1"
+      - --timeout
+      - "3600"                          # 60-min timeout — covers large lead batches
+      - --concurrency
+      - "10"                            # 10 concurrent requests per instance
+      - --set-env-vars
+      - APP_ENV=production,LOG_LEVEL=INFO,CLOUD_TASKS_QUEUE_NAME=lead-enrichment,GCP_LOCATION=${_REGION},INTERNAL_AUTH_TOKEN=generate-a-secure-token-in-production,API_BASE_URL=https://${_SERVICE_NAME}-replace-with-your-url.a.run.app
+      - --set-secrets
+      - PERPLEXITY_API_KEY_0=PERPLEXITY_API_KEY_0:latest,PERPLEXITY_API_KEY_1=PERPLEXITY_API_KEY_1:latest,PERPLEXITY_API_KEY_2=PERPLEXITY_API_KEY_2:latest,PERPLEXITY_API_KEY_3=PERPLEXITY_API_KEY_3:latest,FIREBASE_PROJECT_ID=FIREBASE_PROJECT_ID:latest,SALEQL_API_KEY=SALEQL_API_KEY:latest
+    waitFor: [push]
+
+images:
+  - ${_ARTIFACT_REGISTRY}/${_SERVICE_NAME}:$COMMIT_SHA
+  - ${_ARTIFACT_REGISTRY}/${_SERVICE_NAME}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
